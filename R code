@@ -1,0 +1,294 @@
+#family 
+# Family 500+ Analysis (Cleaned Full Version)
+library(readxl)
+library(Synth)
+library(dplyr)
+library(tidyr)
+
+# === Step 1: Load and Clean Data ===
+fertility_path <- "/Users/roy/Desktop/total_fertility_rate.xlsx"
+gdp_path <- "/Users/roy/Desktop/long_gdp_per_capita.xlsx"
+female_emp_path <- "/Users/roy/Desktop/female_employment_25_54.xlsx"
+edu_path <- "/Users/roy/Desktop/tertiary_edu_25_54.xlsx"
+migration_path <- "/Users/roy/Desktop/net_migration.xlsx"
+
+fertility <- read_excel(fertility_path)
+gdp <- read_excel(gdp_path)
+female_emp <- read_excel(female_emp_path)
+edu <- read_excel(edu_path)
+migration <- read_excel(migration_path)
+
+clean_data <- function(df) {
+  df_long <- df %>%
+    pivot_longer(-1, names_to = "year", values_to = "value") %>%
+    rename(country = 1) %>%
+    mutate(year = as.numeric(year),
+           value = as.numeric(gsub(":", NA, value)))
+  return(df_long)
+}
+
+fertility_long <- clean_data(fertility) %>% filter(year >= 2012, year <= 2022)
+gdp_long <- clean_data(gdp) %>% filter(year >= 2012, year <= 2022)
+female_emp_long <- clean_data(female_emp) %>% filter(year >= 2012, year <= 2022)
+edu_long <- clean_data(edu) %>% filter(year >= 2012, year <= 2022)
+migration_long <- clean_data(migration) %>% filter(year >= 2012, year <= 2022)
+
+common_countries <- Reduce(intersect, list(
+  unique(fertility_long$country),
+  unique(gdp_long$country),
+  unique(female_emp_long$country),
+  unique(edu_long$country),
+  unique(migration_long$country)
+))
+
+fertility_long <- fertility_long %>% filter(country %in% common_countries)
+gdp_long <- gdp_long %>% filter(country %in% common_countries)
+female_emp_long <- female_emp_long %>% filter(country %in% common_countries)
+edu_long <- edu_long %>% filter(country %in% common_countries)
+migration_long <- migration_long %>% filter(country %in% common_countries)
+
+all_data <- fertility_long %>%
+  rename(fertility = value) %>%
+  left_join(gdp_long, by = c("country", "year")) %>%
+  rename(gdp_per_capita = value) %>%
+  left_join(female_emp_long, by = c("country", "year")) %>%
+  rename(female_employment = value) %>%
+  left_join(edu_long, by = c("country", "year")) %>%
+  rename(tertiary_edu = value) %>%
+  left_join(migration_long, by = c("country", "year")) %>%
+  rename(net_migration = value)
+
+# === Step 2: Balance the Dataset ===
+full_grid <- expand.grid(
+  country = unique(all_data$country),
+  year = 2012:2022
+)
+
+all_data_full <- full_grid %>%
+  left_join(all_data, by = c("country", "year"))
+
+pre_treatment_years <- 2012:2015
+
+country_counts <- all_data_full %>%
+  filter(year %in% pre_treatment_years) %>%
+  filter(!is.na(fertility),
+         !is.na(gdp_per_capita),
+         !is.na(female_employment),
+         !is.na(tertiary_edu),
+         !is.na(net_migration)) %>%
+  group_by(country) %>%
+  summarise(n_years = n()) %>%
+  filter(n_years == length(pre_treatment_years)) %>%
+  pull(country)
+
+all_data_balanced <- all_data_full %>%
+  filter(country %in% country_counts)
+
+all_data_balanced <- all_data_balanced %>%
+  mutate(country = as.factor(country),
+         country_id = as.numeric(country)) %>%
+  as.data.frame()
+
+# === Step 3: Set Treatment and Donor Pool ===
+treat_country <- "Poland"
+excluded_countries <- c("Hungary", "Estonia", "Spain", "Italy")
+# (1) Filtra paesi completi
+years_needed <- 2012:2022
+
+country_complete <- all_data_balanced %>%
+  filter(year %in% years_needed) %>%
+  group_by(country) %>%
+  summarise(
+    fertility_na = sum(is.na(fertility)),
+    gdp_na = sum(is.na(gdp_per_capita)),
+    fememp_na = sum(is.na(female_employment)),
+    edu_na = sum(is.na(tertiary_edu)),
+    migration_na = sum(is.na(net_migration))
+  ) %>%
+  mutate(total_na = fertility_na + gdp_na + fememp_na + edu_na + migration_na) %>%
+  filter(total_na == 0) %>%
+  pull(country)
+
+all_data_balanced <- all_data_balanced %>%
+  filter(country %in% country_complete)
+
+# (2) RIFAI treat_id e donor_ids corretti
+treat_id <- unique(all_data_balanced$country_id[all_data_balanced$country == treat_country])
+
+donor_pool <- setdiff(unique(all_data_balanced$country), c(treat_country, excluded_countries))
+
+donor_ids <- unique(all_data_balanced$country_id[all_data_balanced$country %in% donor_pool])
+
+# (3) Ora fai dataprep normalmente
+dataprep_out <- dataprep(
+  foo = all_data_balanced,
+  predictors = c("gdp_per_capita", "female_employment", "tertiary_edu", "net_migration"),
+  predictors.op = "mean",
+  time.predictors.prior = 2012:2015,
+  special.predictors = list(
+    list("fertility", 2012, "mean"),
+    list("fertility", 2013, "mean"),
+    list("fertility", 2014, "mean"),
+    list("fertility", 2015, "mean")
+  ),
+  dependent = "fertility",
+  unit.variable = "country_id",
+  time.variable = "year",
+  treatment.identifier = treat_id,
+  controls.identifier = donor_ids,
+  time.optimize.ssr = 2012:2015,
+  time.plot = 2012:2022
+)
+
+
+# === Step 5: Estimate Synthetic Control ===
+synth_out <- synth(dataprep_out)
+
+# === Step 6: Plot Results ===
+# === Step 6: Plot Results ===
+# Only use controls with complete data
+valid_controls <- apply(dataprep_out$Y0plot, 2, function(x) all(!is.na(x)))
+Y0plot_valid <- dataprep_out$Y0plot[, valid_controls]
+Y1plot_valid <- dataprep_out$Y1plot
+solution_w_valid <- synth_out$solution.w[valid_controls]
+
+# Plot
+plot(dataprep_out$tag$time.plot, Y1plot_valid, type = "l", col = "black", lwd = 2,
+     ylim = range(Y1plot_valid, Y0plot_valid %*% solution_w_valid, na.rm = TRUE),
+     xlab = "Year", ylab = "Total Fertility Rate",
+     main = "Synthetic Control: Poland vs Synthetic Poland")
+
+lines(dataprep_out$tag$time.plot, Y0plot_valid %*% solution_w_valid, col = "red", lwd = 2)
+
+legend("bottomright", # 👈 più basso, non copre il grafico
+       legend = c("Poland", "Synthetic Poland"), 
+       col = c("black", "red"), 
+       lty = 1, lwd = 2, 
+       bty = "n") # 👈 senza box della legenda
+
+abline(v = 2016, lty = 2)
+
+
+# === Step 7: Gap Plot ===
+gap <- Y1plot_valid - (Y0plot_valid %*% solution_w_valid)
+plot(dataprep_out$tag$time.plot, gap, type = "l", lwd = 2,
+     xlab = "Year", ylab = "Gap (Poland - Synthetic)",
+     main = "Gap Plot: Poland vs Synthetic Poland")
+abline(v = 2016, lty = 2)
+
+# === Step 8: Placebo Tests ===
+placebo_ids <- setdiff(donor_ids, treat_id)
+placebo_gaps <- list()
+
+for (pid in placebo_ids) {
+  placebo_dataprep <- dataprep(
+    foo = all_data_balanced,
+    predictors = c("gdp_per_capita", "female_employment", "tertiary_edu", "net_migration"),
+    predictors.op = "mean",
+    time.predictors.prior = 2012:2015,
+    special.predictors = list(
+      list("fertility", 2012, "mean"),
+      list("fertility", 2013, "mean"),
+      list("fertility", 2014, "mean"),
+      list("fertility", 2015, "mean")
+    ),
+    dependent = "fertility",
+    unit.variable = "country_id",
+    time.variable = "year",
+    treatment.identifier = pid,
+    controls.identifier = setdiff(donor_ids, pid),
+    time.optimize.ssr = 2012:2015,
+    time.plot = 2012:2022
+  )
+  
+  synth_res <- tryCatch({
+    synth(placebo_dataprep)
+  }, error = function(e) NULL)
+  
+  if (!is.null(synth_res)) {
+    valid_controls_placebo <- apply(placebo_dataprep$Y0plot, 2, function(x) all(!is.na(x)))
+    gap_placebo <- placebo_dataprep$Y1plot - (placebo_dataprep$Y0plot[, valid_controls_placebo] %*% synth_res$solution.w[valid_controls_placebo])
+    placebo_gaps[[as.character(pid)]] <- gap_placebo
+  }
+}
+
+# === Step 9: Plot Placebos ===
+plot(2012:2022, gap, type = "l", col = "black", lwd = 2,
+     ylim = range(unlist(placebo_gaps), gap, na.rm = TRUE),
+     xlab = "Year", ylab = "Gap (Fertility)",
+     main = "Placebo Test: Poland vs Donor Pool")
+for (g in placebo_gaps) {
+  lines(2012:2022, g, col = "gray70", lty = "dashed")
+}
+lines(2012:2022, gap, col = "black", lwd = 2)
+abline(v = 2016, lty = 2)
+
+# === Step 10: MSPE (Pre-treatment fit) ===
+years_pre_treatment <- 2012:2015
+Y1_pre <- Y1plot_valid[dataprep_out$tag$time.plot %in% years_pre_treatment]
+Y0_pre <- Y0plot_valid[dataprep_out$tag$time.plot %in% years_pre_treatment, ]
+synth_pre <- Y0_pre %*% solution_w_valid
+mspe_pre_treatment <- mean((Y1_pre - synth_pre)^2)
+cat("Pre-treatment MSPE (Poland):", mspe_pre_treatment, "\n")
+
+# === Step 11: Weights Check ===
+round(solution_w_valid, 3)
+sum(solution_w_valid)
+# === Step 12: Placebo MSPE ratios and p-value ===
+
+# Function to compute MSPE
+compute_mspe <- function(gap_vector, pre_treatment_years, all_years) {
+  pre_index <- which(all_years %in% pre_treatment_years)
+  mean(gap_vector[pre_index]^2)
+}
+
+# 1. Compute Poland's MSPE pre and post
+years_all <- 2012:2022
+years_post_treatment <- 2016:2022
+
+poland_mspe_pre <- compute_mspe(gap, pre_treatment_years, years_all)
+poland_mspe_post <- compute_mspe(gap, years_post_treatment, years_all)
+poland_mspe_ratio <- poland_mspe_post / poland_mspe_pre
+
+# 2. Compute MSPEs for each placebo
+placebo_mspe_pre <- sapply(placebo_gaps, compute_mspe, pre_treatment_years, years_all)
+placebo_mspe_post <- sapply(placebo_gaps, compute_mspe, years_post_treatment, years_all)
+placebo_mspe_ratio <- placebo_mspe_post / placebo_mspe_pre
+
+# 3. Exclude badly-fitting placebos (pre-MSPE > 2x Poland's pre-MSPE)
+good_placebos <- names(placebo_mspe_pre)[placebo_mspe_pre <= 2 * poland_mspe_pre]
+filtered_ratios <- placebo_mspe_ratio[good_placebos]
+
+# 4. Calculate p-value: proportion of placebo ratios >= Poland’s ratio
+p_value <- mean(filtered_ratios >= poland_mspe_ratio)
+
+# 5. Output
+cat("Pre-treatment MSPE (Poland):", poland_mspe_pre, "\n")
+#very small: our model fits Poland very well before 2016
+cat("Post/pre MSPE Ratio (Poland):", poland_mspe_ratio, "\n")
+#after the Family 500+ reform, the gap between Poland and Synthetic Poland exploded.
+cat("P-value from placebo test:", p_value, "\n")
+
+# === Step 13: Plot distribution of MSPE ratios ===
+
+library(ggplot2)
+
+# Make a dataframe
+mspe_ratios_df <- data.frame(
+  country = names(filtered_ratios),
+  ratio = filtered_ratios
+)
+
+# Add Poland manually
+mspe_ratios_df <- rbind(mspe_ratios_df, data.frame(country = "Poland", ratio = poland_mspe_ratio))
+
+# Plot
+ggplot(mspe_ratios_df, aes(x = ratio)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "lightgray") +
+  geom_vline(xintercept = poland_mspe_ratio, color = "red", linetype = "dashed", size = 1) +
+  annotate("text", x = poland_mspe_ratio + 5, y = 5, label = "Poland", color = "red") +
+  labs(title = "Distribution of Post/Pre MSPE Ratios",
+       x = "Post/Pre MSPE Ratio",
+       y = "Frequency") +
+  theme_minimal()
+
